@@ -129,38 +129,58 @@ object FreeformLauncher {
             )
         }
 
-        val (l, t, r, b) = listOf(target.left, target.top, target.right, target.bottom)
-        val resize = if (t < 0) {
-            // am task resize は負の top を拒否するため、shell 権限の app_process から直接呼ぶ
-            exec(
-                "CLASSPATH='${context.applicationInfo.sourceDir}' app_process / " +
-                    "${ResizeMain::class.java.name} ${found.id} $l $t $r $b"
-            )
-        } else {
-            exec("am task resize ${found.id} $l $t $r $b")
+        fun resizeTask(rect: Rect): CmdResult {
+            val (l, t, r, b) = listOf(rect.left, rect.top, rect.right, rect.bottom)
+            return if (t < 0) {
+                // am task resize は負の top を拒否するため、shell 権限の app_process から直接呼ぶ
+                exec(
+                    "CLASSPATH='${context.applicationInfo.sourceDir}' app_process / " +
+                        "${ResizeMain::class.java.name} ${found.id} $l $t $r $b"
+                )
+            } else {
+                exec("am task resize ${found.id} $l $t $r $b")
+            }
         }
-        if (!resize.ok || resize.hasError) return fail("リサイズに失敗しました", target, found.bounds)
 
-        // 反映を待って taskId で読み戻す
+        // OS がウィンドウを下へずらして下端がはみ出したら、その分だけ下端を上げて再試行する
         val before = found.bounds
-        var after: TaskEntry? = null
-        for (i in 0 until 10) {
-            Thread.sleep(200)
-            lastStack = ShellExecutor.run("am stack list").stdout
-            after = parseStack(lastStack).firstOrNull { it.id == found.id }
-            val ab = after?.bounds
-            if (ab == target || (ab != null && ab != before)) break
+        var request = Rect(target)
+        var applied: Rect? = null
+        var mode = found.mode
+        for (attempt in 1..3) {
+            val resize = resizeTask(request)
+            if (!resize.ok || resize.hasError) return fail("リサイズに失敗しました", target, applied ?: before)
+            val prev = if (attempt == 1) before else applied
+            var after: TaskEntry? = null
+            for (i in 0 until 10) {
+                Thread.sleep(200)
+                lastStack = ShellExecutor.run("am stack list").stdout
+                after = parseStack(lastStack).firstOrNull { it.id == found.id }
+                val ab = after?.bounds
+                if (ab == request || (ab != null && ab != prev)) break
+            }
+            log.append("$ am stack list（リサイズ後・抜粋）\n").append(excerpt(lastStack, found.id)).append("\n\n")
+            if (after == null) return fail("リサイズ後にタスクが見つかりません", target)
+            mode = after.mode
+            val ab = after.bounds ?: return fail("適用矩形を取得できませんでした", target)
+            applied = ab
+            val overflow = ab.bottom - target.bottom
+            if (overflow <= 0 || ab.top <= request.top) break
+            val next = Rect(request.left, request.top, request.right, request.bottom - overflow)
+            if (next.height() < minPx) break
+            log.append("OS が上端を ${ab.top - request.top}px 下へずらし、下端が ${overflow}px はみ出したため、高さを縮めて再試行\n\n")
+            request = next
         }
-        log.append("$ am stack list（リサイズ後・抜粋）\n").append(excerpt(lastStack, found.id)).append("\n")
 
-        val applied = after?.bounds
+        val ab = applied!!
+        val inside = ab.top >= target.top && ab.bottom <= target.bottom && ab.left >= target.left && ab.right <= target.right
         return when {
-            after == null -> fail("リサイズ後にタスクが見つかりません", target)
-            applied == null -> fail("適用矩形を取得できませんでした", target)
-            applied == target -> LaunchReport(true, "リサイズ完了（指定どおり）", target, applied, log.toString())
-            applied == before ->
-                fail("矩形が変化しませんでした（リサイズ未反映、または前回と同じ補正）mode=${after.mode}", target, applied)
-            else -> LaunchReport(true, "リサイズ完了（OS により補正されました）", target, applied, log.toString())
+            ab == target -> LaunchReport(true, "リサイズ完了（指定どおり）", target, ab, log.toString())
+            ab.bottom > target.bottom ->
+                fail("OS がウィンドウを下へずらし、下端が ${ab.bottom - target.bottom}px はみ出しています (mode=$mode)", target, ab)
+            inside -> LaunchReport(true, "リサイズ完了（画面内に収まるよう補正）", target, ab, log.toString())
+            ab == before -> fail("矩形が変化しませんでした（リサイズ未反映）mode=$mode", target, ab)
+            else -> LaunchReport(true, "リサイズ完了（OS により補正されました）", target, ab, log.toString())
         }
     }
 
