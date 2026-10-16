@@ -123,22 +123,38 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
-            Button(enabled = !running && inputOk && shizukuState == "許可済み", onClick = {
+            fun run(block: () -> LaunchReport) {
                 running = true
                 report = null
-                val m = Margins(values[0]!!, values[1]!!, values[2]!!, values[3]!!)
-                val avoid = avoidStatusBar
                 scope.launch {
                     report = withContext(Dispatchers.IO) {
-                        try {
-                            FreeformLauncher.launch(this@MainActivity, pkg, m, avoid)
-                        } catch (t: Throwable) {
+                        try { block() } catch (t: Throwable) {
                             LaunchReport(false, "内部エラー: $t", log = t.stackTraceToString())
                         }
                     }
                     running = false
                 }
-            }) { Text(if (running) "実行中…" else "起動") }
+            }
+            val ready = !running && shizukuState == "許可済み"
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(enabled = ready && inputOk, onClick = {
+                    val m = Margins(values[0]!!, values[1]!!, values[2]!!, values[3]!!)
+                    val avoid = avoidStatusBar
+                    run { FreeformLauncher.launch(this@MainActivity, pkg, m, avoid) }
+                }) { Text(if (running) "実行中…" else "起動") }
+                Button(enabled = ready && inputOk, onClick = {
+                    val m = Margins(values[0]!!, values[1]!!, values[2]!!, values[3]!!)
+                    val avoid = avoidStatusBar
+                    run { FreeformLauncher.launch(this@MainActivity, pkg, m, avoid, startApp = false) }
+                }) { Text("リサイズのみ") }
+                OutlinedButton(enabled = ready, onClick = {
+                    run { FreeformLauncher.diagnose(this@MainActivity, pkg) }
+                }) { Text("診断") }
+            }
+            Text(
+                "「リサイズのみ」：対象アプリを手でフローティングウィンドウにしてから押すと、そのウィンドウを指定サイズにします。",
+                style = MaterialTheme.typography.bodySmall,
+            )
             if (!inputOk) Text("余白に数値を入力してください", color = MaterialTheme.colorScheme.error)
 
             report?.let { r ->

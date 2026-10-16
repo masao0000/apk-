@@ -37,7 +37,31 @@ object FreeformLauncher {
     fun resolveActivity(context: Context, pkg: String): String? =
         context.packageManager.getLaunchIntentForPackage(pkg)?.component?.className
 
-    fun launch(context: Context, pkg: String, margins: Margins, avoidStatusBar: Boolean): LaunchReport {
+    /** 起動せずに、対象タスクの状態と OS のフリーフォーム関連情報をログに出す */
+    fun diagnose(context: Context, pkg: String): LaunchReport {
+        val log = StringBuilder()
+        val version = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull()
+        log.append("app=$version sdk=${Build.VERSION.SDK_INT} ${Build.MANUFACTURER} ${Build.MODEL} ${Build.DISPLAY}\n\n")
+        val stack = ShellExecutor.run("am stack list")
+        val tasks = parseStack(stack.stdout).filter { it.component.startsWith("$pkg/") }
+        log.append("対象タスク:\n")
+        if (tasks.isEmpty()) log.append("  （なし）\n")
+        tasks.forEach { log.append("  id=${it.id} mode=${it.mode} bounds=${it.bounds?.toShortString()} ${it.component}\n") }
+        log.append("\n$ am stack list（対象部分）\n")
+        tasks.forEach { log.append(excerpt(stack.stdout, it.id)).append("\n") }
+        if (tasks.isEmpty()) log.append(excerpt(stack.stdout, null)).append("\n")
+        listOf(
+            "settings get global enable_freeform_support",
+            "settings get global force_resizable_activities",
+            "pm has-feature android.software.freeform_window_management",
+            "getprop persist.wm.debug.desktop_mode_enforce_device_restrictions",
+            "dumpsys activity activities | grep -iE 'mWindowingMode=|freeform|desktop' | head -40",
+        ).forEach { log.append(ShellExecutor.run(it).format()).append('\n') }
+        val t = tasks.firstOrNull()
+        return LaunchReport(t != null, if (t != null) "診断完了 (mode=${t.mode})" else "対象アプリのタスクがありません", applied = t?.bounds, log = log.toString())
+    }
+
+    fun launch(context: Context, pkg: String, margins: Margins, avoidStatusBar: Boolean, startApp: Boolean = true): LaunchReport {
         val log = StringBuilder()
         fun exec(cmd: String, timeoutSec: Long = 15) =
             ShellExecutor.run(cmd, timeoutSec).also { log.append(it.format()).append('\n') }
@@ -72,6 +96,7 @@ object FreeformLauncher {
             return fail("余白が大きすぎます（最小 ${minPx}px 四方）", target)
 
         // ホームのアイコンと同じ Intent で起動し、既存タスクがあれば前面に出すだけにする
+        if (startApp) {
         val start = exec(
             "am start -W --windowingMode 5 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER " +
                 "-f 0x10200000 -n '$pkg/$activity'",
@@ -79,6 +104,7 @@ object FreeformLauncher {
         )
         // -W はタイムアウトしても起動自体は進んでいるので続行する
         if (start.hasError || (start.exitCode == -1 && !start.timedOut)) return fail("am start に失敗しました", target)
+        }
 
         var task: TaskEntry? = null
         var lastStack = ""
@@ -96,8 +122,9 @@ object FreeformLauncher {
             exec("settings get global enable_freeform_support")
             exec("pm has-feature android.software.freeform_window_management")
             return fail(
-                "フリーフォームで起動していません (mode=${found.mode})。開発者向けオプションの" +
-                    "「フリーフォーム ウィンドウを有効にする」を ON にして再起動してください",
+                "フリーフォームになっていません (mode=${found.mode})。" +
+                    if (startApp) "OS が起動時の指定を無視しました。手でフローティングにしてから「リサイズのみ」を試してください"
+                    else "対象アプリをフローティングウィンドウにしてから実行してください",
                 target, found.bounds,
             )
         }
