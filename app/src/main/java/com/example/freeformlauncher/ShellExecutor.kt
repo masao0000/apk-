@@ -29,10 +29,15 @@ object ShellExecutor {
             val err = StringBuilder()
             val tOut = Thread { out.append(p.inputStream.bufferedReader().readText()) }.apply { start() }
             val tErr = Thread { err.append(p.errorStream.bufferedReader().readText()) }.apply { start() }
-            val finished = p.waitFor(timeoutSec, TimeUnit.SECONDS)
+            // Shizuku の RemoteProcess は waitFor(timeout) 非対応（exitValue が
+            // IllegalArgumentException を投げる）ため、waitFor() を別スレッドで待つ
+            var exit = -1
+            val waiter = Thread { exit = p.waitFor() }.apply { start() }
+            waiter.join(TimeUnit.SECONDS.toMillis(timeoutSec))
+            val finished = !waiter.isAlive
             if (!finished) p.destroy()
             tOut.join(1000); tErr.join(1000)
-            CmdResult(command, if (finished) p.exitValue() else -1, out.toString(),
+            CmdResult(command, exit, out.toString(),
                 err.toString() + if (finished) "" else "\n(timeout)")
         } catch (t: Throwable) {
             val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
