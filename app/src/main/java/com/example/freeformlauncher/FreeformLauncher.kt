@@ -1,8 +1,9 @@
 package com.example.freeformlauncher
 
 import android.content.Context
-import android.content.Intent
 import android.graphics.Rect
+import android.os.Build
+import android.view.WindowInsets
 import android.view.WindowManager
 
 data class Margins(val left: Int = 4, val top: Int = 4, val right: Int = 4, val bottom: Int = 4)
@@ -15,72 +16,166 @@ data class LaunchReport(
     val log: String = "",
 )
 
+/** am stack list の taskId 行 1 つ分 */
+data class TaskEntry(val id: Int, val component: String, val bounds: Rect?, val userId: Int?, val mode: String?)
+
 /**
  * 1. am start --windowingMode 5 でフリーフォーム起動
- * 2. am stack list から taskId を取得
- * 3. am task resize で画面サイズ - 余白 の矩形に変更
- * 4. 実際に適用された矩形を読み戻す
+ * 2. am stack list から taskId とウィンドウモードを取得
+ * 3. am task resize（上が負のときは app_process 経由）で「画面 - 余白」に変更
+ * 4. 実際に適用された矩形を taskId で読み戻す
  */
 object FreeformLauncher {
     const val DEFAULT_PACKAGE = "com.linecorp.LGTMTM" // LINE ディズニー ツムツム
 
+    private val rootTaskRe = Regex("""^\s*RootTask id=""")
+    private val modeRe = Regex("""\bmWindowingMode=([\w-]+)""")
     private val taskLine = Regex("""taskId=(\d+):\s*([^\s/]+)/(\S+)""")
     private val boundsRe = Regex("""bounds=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]""")
+    private val userRe = Regex("""userId=(\d+)""")
 
     fun resolveActivity(context: Context, pkg: String): String? =
         context.packageManager.getLaunchIntentForPackage(pkg)?.component?.className
 
-    /** 現在の回転を反映した画面全体の矩形 */
-    fun screenBounds(context: Context): Rect =
-        context.getSystemService(WindowManager::class.java).maximumWindowMetrics.bounds
-
-    fun launch(context: Context, pkg: String, margins: Margins): LaunchReport {
+    fun launch(context: Context, pkg: String, margins: Margins, avoidStatusBar: Boolean): LaunchReport {
         val log = StringBuilder()
-        fun exec(cmd: String) = ShellExecutor.run(cmd).also { log.append(it.format()).append('\n') }
-        fun fail(msg: String) = LaunchReport(false, msg, log = log.toString())
+        fun exec(cmd: String, timeoutSec: Long = 15) =
+            ShellExecutor.run(cmd, timeoutSec).also { log.append(it.format()).append('\n') }
+        fun fail(msg: String, requested: Rect? = null, applied: Rect? = null) =
+            LaunchReport(false, msg, requested, applied, log.toString())
+
+        val version = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull()
+        log.append("app=$version sdk=${Build.VERSION.SDK_INT} ${Build.MANUFACTURER} ${Build.MODEL} ${Build.DISPLAY}\n")
 
         val activity = resolveActivity(context, pkg) ?: return fail("起動 Activity が見つかりません: $pkg")
-        val screen = screenBounds(context)
+
+        // 画面全体（現在の回転を反映）とシステムバー領域
+        val metrics = context.getSystemService(WindowManager::class.java).maximumWindowMetrics
+        val screen = metrics.bounds
+        val bars = metrics.windowInsets.getInsetsIgnoringVisibility(WindowInsets.Type.systemBars())
+        val stableTop = screen.top + bars.top
         val target = Rect(
             screen.left + margins.left, screen.top + margins.top,
             screen.right - margins.right, screen.bottom - margins.bottom,
         )
-        log.append("screen=$screen target=$target\n\n")
+        log.append("screen=${screen.toShortString()} systemBars=$bars\n")
+        // AOSP の freeform は上端をステータスバー下端より上に置けず、はみ出すと
+        // ウィンドウ全体を下へずらす（縮めない）ので、下端が画面外に出る
+        if (avoidStatusBar && margins.top >= 0 && target.top < stableTop) {
+            log.append("top ${target.top} -> $stableTop（ステータスバーを避ける）\n")
+            target.top = stableTop
+        }
+        log.append("target=${target.toShortString()}\n\n")
 
-        val start = exec("am start -W --windowingMode 5 -n $pkg/$activity")
-        if (!start.ok || start.stdout.contains("Error")) return fail("am start に失敗しました")
+        val minPx = (220 * context.resources.displayMetrics.density).toInt()
+        if (target.width() < minPx || target.height() < minPx)
+            return fail("余白が大きすぎます（最小 ${minPx}px 四方）", target)
 
-        // タスクが現れるまで少し待つ
-        var taskId: Int? = null
-        repeat(10) {
-            taskId = findTask(exec("am stack list").stdout, pkg)?.first
-            if (taskId != null) return@repeat
+        // ホームのアイコンと同じ Intent で起動し、既存タスクがあれば前面に出すだけにする
+        val start = exec(
+            "am start -W --windowingMode 5 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER " +
+                "-f 0x10200000 -n '$pkg/$activity'",
+            timeoutSec = 60,
+        )
+        // -W はタイムアウトしても起動自体は進んでいるので続行する
+        if (start.hasError || (start.exitCode == -1 && !start.timedOut)) return fail("am start に失敗しました", target)
+
+        var task: TaskEntry? = null
+        var lastStack = ""
+        for (i in 0 until 15) {
+            lastStack = ShellExecutor.run("am stack list").stdout
+            task = pickTask(parseStack(lastStack), pkg, activity)
+            if (task != null) break
             Thread.sleep(300)
         }
-        val id = taskId ?: return fail("taskId を取得できませんでした")
+        log.append("$ am stack list（抜粋）\n").append(excerpt(lastStack, task?.id)).append("\n\n")
+        val found = task ?: return fail("taskId を取得できませんでした", target)
+        log.append("task: id=${found.id} mode=${found.mode} bounds=${found.bounds?.toShortString()}\n\n")
 
-        val resize = exec("am task resize $id ${target.left} ${target.top} ${target.right} ${target.bottom}")
-        if (!resize.ok || resize.stderr.isNotBlank() || resize.stdout.contains("Error"))
-            return fail("am task resize に失敗しました")
-
-        Thread.sleep(300)
-        val applied = findTask(exec("am stack list").stdout, pkg)?.second
-        val msg = when {
-            applied == null -> "リサイズ完了（適用矩形は取得できず）"
-            applied == target -> "リサイズ完了（指定どおり）"
-            else -> "リサイズ完了（OS により補正されました）"
+        if (found.mode == "fullscreen" || found.mode == "pinned") {
+            exec("settings get global enable_freeform_support")
+            exec("pm has-feature android.software.freeform_window_management")
+            return fail(
+                "フリーフォームで起動していません (mode=${found.mode})。開発者向けオプションの" +
+                    "「フリーフォーム ウィンドウを有効にする」を ON にして再起動してください",
+                target, found.bounds,
+            )
         }
-        return LaunchReport(true, msg, target, applied, log.toString())
+
+        val (l, t, r, b) = listOf(target.left, target.top, target.right, target.bottom)
+        val resize = if (t < 0) {
+            // am task resize は負の top を拒否するため、shell 権限の app_process から直接呼ぶ
+            exec(
+                "CLASSPATH='${context.applicationInfo.sourceDir}' app_process / " +
+                    "${ResizeMain::class.java.name} ${found.id} $l $t $r $b"
+            )
+        } else {
+            exec("am task resize ${found.id} $l $t $r $b")
+        }
+        if (!resize.ok || resize.hasError) return fail("リサイズに失敗しました", target, found.bounds)
+
+        // 反映を待って taskId で読み戻す
+        val before = found.bounds
+        var after: TaskEntry? = null
+        for (i in 0 until 10) {
+            Thread.sleep(200)
+            lastStack = ShellExecutor.run("am stack list").stdout
+            after = parseStack(lastStack).firstOrNull { it.id == found.id }
+            val ab = after?.bounds
+            if (ab == target || (ab != null && ab != before)) break
+        }
+        log.append("$ am stack list（リサイズ後・抜粋）\n").append(excerpt(lastStack, found.id)).append("\n")
+
+        val applied = after?.bounds
+        return when {
+            after == null -> fail("リサイズ後にタスクが見つかりません", target)
+            applied == null -> fail("適用矩形を取得できませんでした", target)
+            applied == target -> LaunchReport(true, "リサイズ完了（指定どおり）", target, applied, log.toString())
+            applied == before ->
+                fail("矩形が変化しませんでした（リサイズ未反映、または前回と同じ補正）mode=${after.mode}", target, applied)
+            else -> LaunchReport(true, "リサイズ完了（OS により補正されました）", target, applied, log.toString())
+        }
     }
 
-    /** am stack list の出力から pkg のタスク (taskId, bounds) を探す */
-    private fun findTask(output: String, pkg: String): Pair<Int, Rect?>? {
+    /** am stack list の出力をタスク単位に分解する（ウィンドウモードは所属 RootTask のもの） */
+    fun parseStack(output: String): List<TaskEntry> {
+        val result = mutableListOf<TaskEntry>()
+        var mode: String? = null
         for (line in output.lineSequence()) {
-            val m = taskLine.find(line) ?: continue
-            if (m.groupValues[2] != pkg) continue
-            val b = boundsRe.find(line, m.range.last)?.groupValues?.drop(1)?.map { it.toInt() }
-            return m.groupValues[1].toInt() to b?.let { Rect(it[0], it[1], it[2], it[3]) }
+            if (rootTaskRe.containsMatchIn(line)) { mode = null; continue }
+            val m = taskLine.find(line)
+            if (m == null) {
+                modeRe.find(line)?.let { mode = it.groupValues[1] }
+                continue
+            }
+            val tail = line.substring(m.range.last + 1)
+            val b = boundsRe.find(tail)?.groupValues?.drop(1)?.map { it.toInt() }
+            result += TaskEntry(
+                id = m.groupValues[1].toInt(),
+                component = "${m.groupValues[2]}/${m.groupValues[3]}",
+                bounds = b?.let { Rect(it[0], it[1], it[2], it[3]) },
+                userId = userRe.find(tail)?.groupValues?.get(1)?.toInt(),
+                mode = mode,
+            )
         }
-        return null
+        return result
+    }
+
+    /** 同じパッケージのタスクが複数あるとき、自ユーザー・起動 Activity 一致・freeform を優先 */
+    private fun pickTask(all: List<TaskEntry>, pkg: String, activity: String): TaskEntry? {
+        val myUser = android.os.Process.myUid() / 100000
+        val full = "$pkg/$activity"
+        val short = "$pkg/" + activity.removePrefix(pkg)
+        val mine = all.filter { it.component.startsWith("$pkg/") && (it.userId == null || it.userId == myUser) }
+        val exact = mine.filter { it.component == full || it.component == short }
+        return exact.firstOrNull { it.mode == "freeform" } ?: exact.firstOrNull() ?: mine.firstOrNull()
+    }
+
+    /** ログ用に、対象タスクを含む RootTask ブロックだけを切り出す */
+    private fun excerpt(output: String, taskId: Int?): String {
+        val blocks = output.split(Regex("""(?m)^(?=\s*RootTask id=)"""))
+        val hit = taskId?.let { id -> blocks.firstOrNull { it.contains("taskId=$id:") } }
+        val text = (hit ?: output).trimEnd()
+        return if (text.length > 4000) text.take(4000) + "\n…（省略）" else text
     }
 }

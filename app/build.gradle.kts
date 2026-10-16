@@ -12,12 +12,12 @@ android {
         applicationId = "com.example.freeformlauncher"
         minSdk = 30
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 3
+        versionName = "0.2.0"
     }
 
     signingConfigs {
-        // 再ビルドしても上書きインストールできるよう固定鍵を同梱
+        // 再ビルドしても上書きインストールできるよう固定鍵を同梱（秘密鍵ごと公開。個人利用前提）
         create("shared") {
             storeFile = rootProject.file("keystore/shared.jks")
             storePassword = "freeform"
