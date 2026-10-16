@@ -74,11 +74,20 @@ class MainActivity : ComponentActivity() {
         val scope = rememberCoroutineScope()
         val pkg = FreeformLauncher.DEFAULT_PACKAGE
         val activity = remember(pkg) { FreeformLauncher.resolveActivity(this, pkg) }
-        var left by rememberSaveable { mutableStateOf("4") }
-        var top by rememberSaveable { mutableStateOf("4") }
-        var right by rememberSaveable { mutableStateOf("4") }
-        var bottom by rememberSaveable { mutableStateOf("4") }
-        var avoidStatusBar by rememberSaveable { mutableStateOf(true) }
+        // 余白は入力するたびに保存し、次回起動時も同じ値を使う
+        val prefs = remember { getSharedPreferences("settings", MODE_PRIVATE) }
+        var left by rememberSaveable { mutableStateOf(prefs.getString("left", "4")!!) }
+        var top by rememberSaveable { mutableStateOf(prefs.getString("top", "4")!!) }
+        var right by rememberSaveable { mutableStateOf(prefs.getString("right", "4")!!) }
+        var bottom by rememberSaveable { mutableStateOf(prefs.getString("bottom", "4")!!) }
+        var avoidStatusBar by rememberSaveable { mutableStateOf(prefs.getBoolean("avoidStatusBar", true)) }
+        LaunchedEffect(left, top, right, bottom, avoidStatusBar) {
+            prefs.edit()
+                .putString("left", left).putString("top", top)
+                .putString("right", right).putString("bottom", bottom)
+                .putBoolean("avoidStatusBar", avoidStatusBar)
+                .apply()
+        }
         var running by remember { mutableStateOf(false) }
         var report by remember { mutableStateOf<LaunchReport?>(null) }
 
@@ -103,7 +112,7 @@ class MainActivity : ComponentActivity() {
             Text("対象: $pkg")
             Text("Activity: ${activity ?: "（未インストール）"}")
 
-            Text("余白 (px)  ※上はマイナス可（実験）")
+            Text("余白 (px)  ※自動で保存されます。上はマイナス可（実験）")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 MarginField("左", left, false) { left = it }
                 MarginField("上", top, true) { top = it }
